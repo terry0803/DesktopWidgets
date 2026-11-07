@@ -1,0 +1,4 @@
+# Linked into the program as they are: never touched by line-ending conversion.
+*.o binary
+*.res binary
+*.ico binary
