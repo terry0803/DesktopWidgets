@@ -216,6 +216,8 @@ struct App {
     title_before: Option<String>,
     /// The date the countdown's date field opened with, to tell whether it was changed.
     date_offered: Option<String>,
+    /// The same for the countdown's name field.
+    title_offered: Option<String>,
     /// The screen changed while a card was held, which has to wait until it's let go.
     relayout_missed: bool,
     /// The size the wallpaper was cropped for.
@@ -673,7 +675,9 @@ impl App {
                 self.todos.push(Todo { done: false, text });
                 self.unsaved_todos = true;
             }
-            Some(Editing::CountdownTitle) if !text.is_empty() => {
+            // Left as it was offered, the name isn't written either: the settings may have been read meanwhile.
+            Some(Editing::CountdownTitle) if !text.is_empty() && self.title_offered.as_deref() != Some(text.as_str()) => {
+                self.title_offered = None;
                 self.settings.countdown_title = text.replace(['\r', '\n'], " ");
                 self.unsaved_settings = true;
             }
@@ -1377,8 +1381,10 @@ impl App {
         }
     }
 
-    fn delete_todo(&mut self, row: usize) {
-        if self.sync_todos() {
+    // `then` is the list as it was when the menu opened. If it has changed since (an edit elsewhere, or the file read at
+    // last while the menu was open), the row no longer says which to-do was meant, and nothing is deleted.
+    fn delete_todo(&mut self, row: usize, then: &[store::Todo]) {
+        if self.sync_todos() || self.todos != then {
             return;
         }
         if let Some(position) = cards::todo_order(&self.todos).get(row).copied() {
@@ -1521,7 +1527,7 @@ fn add_item(menu: HMENU, id: usize, text: &str, checked: bool, enabled: bool) {
 /// The menu, for a card, or with `None` for the icon by the clock, which has only what's about all of them.
 fn show_menu(card: Option<usize>, row: Option<usize>) {
     unsafe {
-        let Some((hidden, kind, size, locked, visible, manual, current_zoom, unsaved, count_up)) = with(|app| {
+        let Some((hidden, kind, size, locked, visible, manual, current_zoom, unsaved, count_up, todos_then)) = with(|app| {
             (
                 app.hidden,
                 card.map(|index| app.slots[index].kind),
@@ -1532,6 +1538,7 @@ fn show_menu(card: Option<usize>, row: Option<usize>) {
                 app.settings.zoom,
                 app.unsaved_settings || app.unsaved_todos,
                 app.settings.count_up,
+                row.map(|_| app.todos.clone()).unwrap_or_default(),
             )
         }) else {
             return;
@@ -1607,11 +1614,12 @@ fn show_menu(card: Option<usize>, row: Option<usize>) {
             let _ = SetForegroundWindow(previous);
         }
         let _ = DestroyMenu(menu);
-        run_command(command, card, row, previous);
+        run_command(command, card, row, &todos_then, previous);
     }
 }
 
-fn run_command(command: usize, card: Option<usize>, row: Option<usize>, previous: HWND) {
+// `todos_then`: the to-do list when the menu opened, which `row` counts in.
+fn run_command(command: usize, card: Option<usize>, row: Option<usize>, todos_then: &[store::Todo], previous: HWND) {
     match command {
         0 => {}
         MENU_LOCK => {
@@ -1637,7 +1645,7 @@ fn run_command(command: usize, card: Option<usize>, row: Option<usize>, previous
         }
         MENU_DELETE => {
             if let Some(row) = row {
-                with(|app| app.delete_todo(row));
+                with(|app| app.delete_todo(row, todos_then));
             }
         }
         MENU_EXIT => {
@@ -1713,7 +1721,12 @@ fn edit_place(after: After) {
     let current = with(|app| app.settings.weather_place.as_ref().map(|place| place.name.clone())).flatten();
     let Some(field) = begin_edit(Kind::Weather, Editing::Place) else { return };
     let (answer, field) = prompt::ask(&field, current.as_deref().unwrap_or(""), after);
+    // The settings may have been read from the file while the field was open: then the name it was opened with, left as
+    // it was, isn't a choice of the old place over the one there is now.
+    let now = with(|app| app.settings.weather_place.as_ref().map(|place| place.name.clone())).flatten();
+    let untouched_but_changed = |name: &String| Some(name) == current.as_ref() && now != current;
     match answer {
+        Answer::Entered(name) if untouched_but_changed(&name) => {}
         Answer::Entered(name) if !name.is_empty() => {
             with(|app| app.place_typed(name));
         }
@@ -1753,15 +1766,21 @@ fn add_todo(after: After) {
 fn edit_countdown(after: After) {
     let Some((title, target)) = with(|app| {
         app.date_refused = None;
+        app.title_offered = Some(app.settings.countdown_title.clone());
         (app.settings.countdown_title.clone(), app.settings.countdown_date)
     }) else {
         return;
     };
-    let Some(field) = begin_edit(Kind::Countdown, Editing::CountdownTitle) else { return };
+    let Some(field) = begin_edit(Kind::Countdown, Editing::CountdownTitle) else {
+        with(|app| app.title_offered = None);
+        return;
+    };
     let (answer, mut open) = prompt::ask(&field, &title, after);
-    // Nothing typed keeps the name there is now, which may have been read from the file meanwhile.
+    with(|app| app.title_offered = None);
+    // Nothing typed, or the name offered left as it was, keeps the name there is now, which may have been read from the
+    // file meanwhile: the field still holds the one it was opened with.
     let named = |text: String| {
-        if text.is_empty() {
+        if text.is_empty() || text == title {
             with(|app| app.settings.countdown_title.clone()).unwrap_or_else(|| title.clone())
         } else {
             text.replace(['\r', '\n'], " ")
@@ -2403,6 +2422,7 @@ fn main() {
             relayout_missed: false,
             title_before: None,
             date_offered: None,
+            title_offered: None,
             screen: (0, 0),
             tray: tray_icon(),
         };

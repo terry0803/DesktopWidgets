@@ -71,26 +71,115 @@ fn nearest_clear(moving: Rect, others: &[Rect], icons: &[Rect], area: Rect, rule
         xs.extend([blocker.right() + rules.gap, blocker.x - rules.gap - moving.w, blocker.right(), blocker.x - moving.w]);
         ys.extend([blocker.bottom() + rules.gap, blocker.y - rules.gap - moving.h, blocker.bottom(), blocker.y - moving.h]);
     }
-    // Icons stand in rows and columns, so most of these repeat. Kept in order, so that ties go the same way.
+    // Icons stand in rows and columns, so most of these repeat. Kept in order, so that ties go the same way. A place
+    // that would put the card past the area's edge can never fit, so it isn't tried.
     let (xs, ys) = (unique(xs), unique(ys));
-    // A spot that keeps the usual distance wins over a nearer one that only just fits, as in free_spot.
-    [rules.gap, 0].into_iter().find_map(|space| {
-        let fits = |card: Rect| {
-            let wider = card.grown_by(space);
-            area.holds(card) && !icons.iter().chain(others).any(|blocker| blocker.overlaps(wider))
+    let xs: Vec<i32> = xs.into_iter().filter(|x| *x >= area.x && *x + moving.w <= area.right()).collect();
+    let ys: Vec<i32> = ys.into_iter().filter(|y| *y >= area.y && *y + moving.h <= area.bottom()).collect();
+    let search = |space: i32| {
+        // Only what reaches into the area can be in the way of a card inside it (icons on another screen can't).
+        let grown = icons.iter().chain(others).map(|blocker| blocker.grown_by(space));
+        let blockers = Cells::new(grown.filter(|blocker| blocker.overlaps(area)));
+        // Each place's columns and rows worked out once, not again for every place it's paired with.
+        let columns: Vec<_> = xs.iter().map(|x| Cells::span(&blockers.xs, *x, x + moving.w)).collect();
+        let rows: Vec<_> = ys.iter().map(|y| Cells::span(&blockers.ys, *y, y + moving.h)).collect();
+        nearest(&xs, &ys, moving, |x, y| !blockers.blocked(columns[x], rows[y]))
+    };
+    // A spot that keeps the usual distance wins over a nearer one that only just fits, as in free_spot. Nowhere that
+    // only just fits means nowhere with the distance either, so a screen with no room is searched once, not twice.
+    let tight = search(0)?;
+    search(rules.gap).or(Some(tight))
+}
+
+// Every place, nearest first, the first that fits winning; of equally near ones, the one earlier in the lists. A
+// row is left as soon as its places are farther than the best so far, and so is the search.
+fn nearest(xs: &[i32], ys: &[i32], moving: Rect, fits: impl Fn(usize, usize) -> bool) -> Option<(i32, i32)> {
+    let by_distance = |values: &[i32], from: i32| {
+        let mut order: Vec<(i32, usize)> = values.iter().enumerate().map(|(index, value)| ((value - from).abs(), index)).collect();
+        order.sort_unstable();
+        order
+    };
+    let (across, down) = (by_distance(xs, moving.x), by_distance(ys, moving.y));
+    let mut best: Option<((i32, usize, usize), (i32, i32))> = None;
+    for &(dx, x) in &across {
+        if best.is_some_and(|((distance, _, _), _)| dx > distance) {
+            break;
+        }
+        for &(dy, y) in &down {
+            let key = (dx + dy, x, y);
+            if best.is_some_and(|(known, _)| key.0 > known.0) {
+                break;
+            }
+            if best.is_some_and(|(known, _)| key >= known) {
+                continue;
+            }
+            if fits(x, y) {
+                best = Some((key, (xs[x], ys[y])));
+                break; // The rest of this row is farther, or as near but later in the list.
+            }
+        }
+    }
+    best.map(|(_, position)| position)
+}
+
+// The blockers on a grid cut along their own edges, so each cell is either all blocked or all free, and a table of
+// running totals says at once whether any rectangle holds a blocked cell. Exact, and the same cost for every place.
+struct Cells {
+    xs: Vec<i32>,
+    ys: Vec<i32>,
+    totals: Vec<u32>,
+}
+
+impl Cells {
+    fn new(blockers: impl Iterator<Item = Rect>) -> Self {
+        let blockers: Vec<Rect> = blockers.collect();
+        let edges = |pick: fn(&Rect) -> [i32; 2]| {
+            let mut edges: Vec<i32> = blockers.iter().flat_map(pick).collect();
+            edges.sort_unstable();
+            edges.dedup();
+            edges
         };
-        let mut best = None;
-        for &x in &xs {
-            for &y in &ys {
-                let distance = (x - moving.x).abs() + (y - moving.y).abs();
-                // The cheap comparison first: most candidates lose it, and then the blockers needn't be gone through.
-                if best.is_none_or(|(known, _)| distance < known) && fits(Rect { x, y, ..moving }) {
-                    best = Some((distance, (x, y)));
+        let (xs, ys) = (edges(|b| [b.x, b.right()]), edges(|b| [b.y, b.bottom()]));
+        let (columns, rows) = (xs.len().saturating_sub(1), ys.len().saturating_sub(1));
+        let mut totals = vec![0u32; (columns + 1) * (rows + 1)];
+        let at = |column: usize, row: usize| row * (columns + 1) + column;
+        for blocker in &blockers {
+            let (left, right) = (xs.partition_point(|x| *x < blocker.x), xs.partition_point(|x| *x < blocker.right()));
+            let (top, bottom) = (ys.partition_point(|y| *y < blocker.y), ys.partition_point(|y| *y < blocker.bottom()));
+            for row in top..bottom {
+                for column in left..right {
+                    totals[at(column + 1, row + 1)] = 1;
                 }
             }
         }
-        best.map(|(_, position)| position)
-    })
+        for row in 1..=rows {
+            for column in 1..=columns {
+                totals[at(column, row)] += totals[at(column - 1, row)] + totals[at(column, row - 1)] - totals[at(column - 1, row - 1)];
+            }
+        }
+        Self { xs, ys, totals }
+    }
+
+    // The cells between two edges a rectangle reaches into: from the one holding `from` to before `to`.
+    fn span(edges: &[i32], from: i32, to: i32) -> (usize, usize) {
+        let cells = edges.len().saturating_sub(1);
+        (edges.partition_point(|edge| *edge <= from).saturating_sub(1), edges.partition_point(|edge| *edge < to).min(cells))
+    }
+
+    #[cfg(test)]
+    fn overlaps(&self, rect: Rect) -> bool {
+        self.blocked(Self::span(&self.xs, rect.x, rect.right()), Self::span(&self.ys, rect.y, rect.bottom()))
+    }
+
+    // Whether any of these cells (from span) is blocked.
+    fn blocked(&self, (left, right): (usize, usize), (top, bottom): (usize, usize)) -> bool {
+        if left >= right || top >= bottom {
+            return false;
+        }
+        let columns = self.xs.len();
+        let at = |column: usize, row: usize| row * columns + column;
+        self.totals[at(right, bottom)] + self.totals[at(left, top)] > self.totals[at(left, bottom)] + self.totals[at(right, top)]
+    }
 }
 
 fn unique(mut values: Vec<i32>) -> Vec<i32> {
@@ -430,6 +519,161 @@ mod tests {
         let placed = Rect { x, y, ..moving };
         assert!(!icons.iter().any(|icon| icon.overlaps(placed)) && screen.holds(placed), "{placed:?}");
         assert!(started.elapsed() < std::time::Duration::from_millis(500), "{:?}", started.elapsed());
+    }
+
+    // The search as it was before: every place, nearest wins, earlier in the lists on a tie.
+    fn every_place(moving: Rect, others: &[Rect], icons: &[Rect], area: Rect, rules: &Rules) -> Option<(i32, i32)> {
+        let mut xs = vec![moving.x];
+        let mut ys = vec![moving.y];
+        for blocker in icons.iter().chain(others) {
+            xs.extend([blocker.right() + rules.gap, blocker.x - rules.gap - moving.w, blocker.right(), blocker.x - moving.w]);
+            ys.extend([blocker.bottom() + rules.gap, blocker.y - rules.gap - moving.h, blocker.bottom(), blocker.y - moving.h]);
+        }
+        let (xs, ys) = (unique(xs), unique(ys));
+        [rules.gap, 0].into_iter().find_map(|space| {
+            let mut best = None;
+            for &x in &xs {
+                for &y in &ys {
+                    let card = Rect { x, y, ..moving };
+                    let distance = (x - moving.x).abs() + (y - moving.y).abs();
+                    let clear = area.holds(card) && !icons.iter().chain(others).any(|blocker| blocker.overlaps(card.grown_by(space)));
+                    if clear && best.is_none_or(|(known, _)| distance < known) {
+                        best = Some((distance, (x, y)));
+                    }
+                }
+            }
+            best.map(|(_, position)| position)
+        })
+    }
+
+    #[test]
+    fn the_quick_search_lands_where_trying_every_place_does() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |below: i32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % below as u64) as i32
+        };
+        for _ in 0..3000 {
+            let icons: Vec<Rect> = (0..next(30)).map(|_| icon(next(1360), next(810))).collect();
+            let others: Vec<Rect> = (0..next(5)).map(|_| card(next(1280), next(740))).collect();
+            let moving = Rect { x: next(1300), y: next(760), w: [158, 338][next(2) as usize], h: [158, 338][next(2) as usize] };
+            let (quick, every) = (nearest_clear(moving, &others, &icons, SCREEN, &RULES), every_place(moving, &others, &icons, SCREEN, &RULES));
+            assert_eq!(quick, every, "{moving:?}");
+        }
+    }
+
+    #[test]
+    fn hundreds_of_scattered_icons_are_searched_quickly() {
+        // Not lined up, so hardly any place repeats: the case that used to take most of a second.
+        let screen = Rect { x: 0, y: 0, w: 2880, h: 1800 };
+        let mut icons = Vec::new();
+        let mut seed = 12345u64;
+        while icons.len() < 400 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let candidate = icon((seed >> 33) as i32 % 2800, (seed >> 13) as i32 % 1710);
+            if !icons.iter().any(|placed: &Rect| placed.overlaps(candidate)) {
+                icons.push(candidate);
+            }
+        }
+        let moving = Rect { x: 1200, y: 700, w: 338, h: 338 };
+        let started = std::time::Instant::now();
+        let (x, y) = keep_clear(moving, &[], &icons, screen, &RULES);
+        let placed = Rect { x, y, ..moving };
+        // The program is an optimised build; a debug build of the tests is several times slower.
+        let limit = if cfg!(debug_assertions) { 2000 } else { 200 };
+        assert!(started.elapsed() < std::time::Duration::from_millis(limit), "{:?}", started.elapsed());
+        assert!((x, y) == (moving.x, moving.y) || !icons.iter().any(|icon| icon.overlaps(placed)));
+    }
+
+    // Icons scattered over `screens` until no big card fits anywhere: every drag update searches everything.
+    fn no_room_for_a_big_card(screens: &[Rect], count: usize) -> Vec<Rect> {
+        let mut icons = Vec::new();
+        let mut seed = 4242u64;
+        while icons.len() < count {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let screen = screens[(seed >> 60) as usize % screens.len()];
+            let candidate = Rect { x: screen.x + (seed >> 33) as i32 % (screen.w - 80), y: screen.y + (seed >> 13) as i32 % (screen.h - 90), w: 80, h: 90 };
+            if !icons.iter().any(|placed: &Rect| placed.overlaps(candidate)) {
+                icons.push(candidate);
+            }
+        }
+        icons
+    }
+
+    #[test]
+    fn a_drag_with_no_room_anywhere_stays_quick() {
+        // A large card at 200% (338 x 2 x 85%), dragged over icons that leave it nowhere to go.
+        let rules = Rules { gap: 37, margin: 41, reach: 51 };
+        let one = Rect { x: 0, y: 0, w: 2880, h: 2160 };
+        let (left, right) = (Rect { x: 0, y: 0, w: 3840, h: 2160 }, Rect { x: 3840, y: 0, w: 3840, h: 2160 });
+        for (screens, count, area) in [(vec![one], 400, one), (vec![left, right], 1000, left)] {
+            let icons = no_room_for_a_big_card(&screens, count);
+            // Checked once, slowly: there really is no room, so each update below searches everything.
+            assert_eq!(every_place(Rect { x: 900, y: 700, w: 575, h: 575 }, &[], &icons, area, &rules), None);
+            let mut times = Vec::new();
+            for step in 0..10 {
+                let moving = Rect { x: 900 + step * 7, y: 700 + step * 5, w: 575, h: 575 };
+                let started = std::time::Instant::now();
+                let (x, y) = settle(moving, &[], &icons, area, &rules);
+                times.push(started.elapsed());
+                assert_eq!((x, y), (moving.x, moving.y), "nowhere to go: the card stays where it is");
+            }
+            times.sort();
+            eprintln!("{count} icons: median {:?}", times[5]);
+            let limit = if cfg!(debug_assertions) { 200 } else { 16 };
+            assert!(times[5] < std::time::Duration::from_millis(limit), "{count} icons: {:?}", times[5]);
+        }
+    }
+
+    #[test]
+    fn a_crowded_screen_with_room_left_never_ends_on_an_icon() {
+        // Enough scattered icons that the exact search gives up before reaching the free spot.
+        let screen = Rect { x: 0, y: 0, w: 2880, h: 1800 };
+        let mut seed = 777u64;
+        for round in 0..20 {
+            let mut icons = Vec::new();
+            while icons.len() < 120 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let candidate = icon((seed >> 33) as i32 % 2800, (seed >> 13) as i32 % 1710);
+                if !icons.iter().any(|placed: &Rect| placed.grown_by(30).overlaps(candidate)) {
+                    icons.push(candidate);
+                }
+            }
+            let moving = Rect { x: 1200, y: 700, w: 676, h: 676 };
+            let (x, y) = keep_clear(moving, &[], &icons, screen, &RULES);
+            let placed = Rect { x, y, ..moving };
+            let room = every_place(moving, &[], &icons, screen, &RULES).is_some();
+            assert!(!room || !icons.iter().any(|icon| icon.overlaps(placed)), "round {round}: {placed:?}");
+        }
+    }
+
+    #[test]
+    fn a_card_fits_a_channel_just_wider_than_it() {
+        // 136 pixels between two columns of icons, for a card 134 wide: no room for the gap, but room.
+        let icons: Vec<Rect> = (0..10).flat_map(|row| [Rect { x: 500, y: row * 90, w: 80, h: 90 }, Rect { x: 716, y: row * 90, w: 80, h: 90 }]).collect();
+        let moving = Rect { x: 560, y: 300, w: 134, h: 134 };
+        let (x, y) = keep_clear(moving, &[], &icons, Rect { x: 0, y: 0, w: 1300, h: 900 }, &RULES);
+        let placed = Rect { x, y, ..moving };
+        assert!(!icons.iter().any(|icon| icon.overlaps(placed)), "{placed:?}");
+    }
+
+    #[test]
+    fn the_cells_agree_with_checking_every_blocker() {
+        let mut seed = 99u64;
+        let mut next = |below: i32| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) % below as u64) as i32
+        };
+        for _ in 0..2000 {
+            let blockers: Vec<Rect> = (0..next(40)).map(|_| Rect { x: next(1400), y: next(880), w: 1 + next(300), h: 1 + next(300) }).collect();
+            let cells = Cells::new(blockers.iter().copied());
+            for _ in 0..50 {
+                let rect = Rect { x: next(1500) - 50, y: next(950) - 50, w: 1 + next(400), h: 1 + next(400) };
+                assert_eq!(cells.overlaps(rect), blockers.iter().any(|b| b.overlaps(rect)), "{rect:?}");
+            }
+        }
     }
 
     #[test]

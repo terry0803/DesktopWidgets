@@ -60,7 +60,7 @@ impl Default for Settings {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Todo {
     pub done: bool,
     pub text: String,
@@ -130,7 +130,8 @@ fn back_up(name: &str) -> bool {
     target.is_some_and(|target| fs::write(target, content).is_ok())
 }
 
-fn write_file(name: &str, text: &str) -> std::io::Result<()> {
+// `before_replacing` runs before each attempt to put the new file in place, and can stop it.
+fn write_file(name: &str, text: &str, before_replacing: &mut dyn FnMut() -> bool) -> std::io::Result<()> {
     let path = folder().join(name);
     let temporary = path.with_extension("tmp");
     let written = (|| {
@@ -142,6 +143,10 @@ fn write_file(name: &str, text: &str) -> std::io::Result<()> {
     if result.is_ok() {
         // A virus scanner or an editor can hold the old file for a moment.
         for attempt in 0..ATTEMPTS {
+            if !before_replacing() {
+                result = Err(std::io::Error::other("the file changed and no copy of it could be kept"));
+                break;
+            }
             result = fs::rename(&temporary, &path);
             if result.is_ok() {
                 break;
@@ -175,7 +180,25 @@ fn save(tracked: &Tracked, text: &str) -> bool {
     if on_disk.is_some() && changed && !back_up(tracked.name) {
         return false;
     }
-    let saved = write_file(tracked.name, text).is_ok();
+    // Another program can write the file while this waits to try again: whatever is there just before it's
+    // replaced is what gets a copy, not what was there when this began.
+    let mut expected = on_disk;
+    let mut keep_what_is_there = || {
+        let now = match fs::read(folder().join(tracked.name)) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            // What can't be seen isn't replaced: Windows can refuse reading a file and still allow replacing it.
+            Err(_) => return false,
+        };
+        if now != expected {
+            if now.is_some() && !back_up(tracked.name) {
+                return false;
+            }
+            expected = now;
+        }
+        true
+    };
+    let saved = write_file(tracked.name, text, &mut keep_what_is_there).is_ok();
     if saved {
         *tracked.known.borrow_mut() = Some(text.as_bytes().to_vec());
         tracked.uncopied.set(false);
@@ -1227,6 +1250,29 @@ mod tests {
         assert!(save_todos(&[todo("a")]));
         assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), before);
         assert!(save_todos(&[todo("b")]));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "[ ] b\n");
+    }
+
+    #[test]
+    fn a_change_made_while_a_save_waits_gets_a_copy() {
+        let path = scratch("changed-while-waiting");
+        assert!(save_todos(&[todo("a")]));
+        let file = path.join(TODO_FILE);
+        let mut expected = Some(fs::read(&file).unwrap());
+        let mut first = true;
+        let mut check = || {
+            if std::mem::take(&mut first) {
+                fs::write(&file, "[ ] written meanwhile\n").unwrap(); // As if another editor saved just now.
+            }
+            let now = fs::read(&file).ok();
+            if now != expected {
+                assert!(back_up(TODO_FILE));
+                expected = now;
+            }
+            true
+        };
+        write_file(TODO_FILE, "[ ] b\n", &mut check).unwrap();
+        assert_eq!(fs::read_to_string(path.join("todo.txt.bak")).unwrap(), "[ ] written meanwhile\n");
         assert_eq!(fs::read_to_string(&file).unwrap(), "[ ] b\n");
     }
 
