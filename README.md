@@ -4,7 +4,7 @@
 
 ## 使用
 
-`build.ps1` 會把程式裝到 `%LOCALAPPDATA%\Programs\DesktopWidgets`，設定和待辦也存在那裡。這個資料夾在 C 槽，所以原始碼所在的磁碟拔掉了，小工具照樣能開。從開始功能表開「桌面小工具」就行：程式第一次啟動時會自己建立這個捷徑。
+`build.ps1` 會把程式裝到 `%LOCALAPPDATA%\Programs\DesktopWidgets`，設定和待辦也存在那裡。這個資料夾在 C 槽，所以原始碼所在的磁碟拔掉了，小工具照樣能開。建置完會自動啟動，第一次啟動時會在開始功能表建立「桌面小工具」捷徑，之後從那裡開就行。
 
 - 工作列右下角的通知區有它的圖示，左鍵或右鍵都會開出整體的選單：整體大小、顯示卡片、鎖定、重設、開機時啟動、結束。卡片被視窗蓋住時也找得到它。Windows 11 會先把新圖示收在 ^ 裡，可以拖到工作列上，或在「設定 > 個人化 > 工作列 > 其他系統匣圖示」打開
 - 開機自動啟動可以在「設定 > 應用程式 > 啟動」裡開關，名稱是「桌面小工具」。第一次啟動時會加進那份清單，預設是關的；選單裡的「開機時啟動」和設定裡的開關是同一個
@@ -28,12 +28,20 @@
 
 ## 建置
 
-需要 Rust 的 `stable-x86_64-pc-windows-gnu` 工具鏈。不用裝 Visual Studio。
+需要 Rust 的 `stable-x86_64-pc-windows-gnu` 工具鏈，不用裝 Visual Studio。先從 <https://rustup.rs> 裝好 rustup，再裝這個工具鏈：
+
+```powershell
+rustup toolchain install stable-x86_64-pc-windows-gnu
+```
+
+不用把它設成預設：`build.ps1` 一定用這個工具鏈，就算 rustup 的預設是 MSVC 也一樣。接著在這個資料夾執行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1
 powershell -ExecutionPolicy Bypass -File build.ps1 -Test
 ```
+
+第一個指令會建置、安裝並啟動小工具；第二個只跑測試。
 
 `windows` crate 固定在 0.59，`windows-result` 和 `windows-strings` 固定在 0.3.0。之後的版本編譯時要用 `dlltool` 加組譯器，這個工具鏈沒有附組譯器。
 
