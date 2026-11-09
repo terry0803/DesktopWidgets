@@ -32,10 +32,10 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
     MONITOR_DEFAULTTOPRIMARY,
 };
-use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ};
 use windows::Win32::UI::Shell::{
     IShellLinkW, ShellLink, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4, SLGP_RAWPATH,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Power::{
@@ -446,7 +446,9 @@ fn set_starts_with_windows(enabled: bool) {
 }
 
 // The entry Windows Settings lists under Startup apps, where it can be switched on and off. A first start adds it
-// switched off, so that starting with Windows is the owner's choice. It follows the program if that moves.
+// switched off, so that starting with Windows is the owner's choice. It follows the program only once the program it
+// names is gone: another copy started now and then (a build in target\, an old copy on a drive that gets unplugged)
+// must not take startup away from the installed one.
 fn register_startup() {
     let Some(command) = exe_command() else { return };
     match run_entry() {
@@ -454,9 +456,15 @@ fn register_startup() {
             write_switch(false);
             write_run_entry(&command);
         }
-        Some(known) if !known.eq_ignore_ascii_case(&command) => write_run_entry(&command),
+        Some(known) if takes_over(&known, &command, |path| std::path::Path::new(path).is_file()) => {
+            write_run_entry(&command)
+        }
         Some(_) => {}
     }
+}
+
+fn takes_over(known: &str, command: &str, exists: impl Fn(&str) -> bool) -> bool {
+    !known.eq_ignore_ascii_case(command) && !exists(known.trim().trim_matches('"'))
 }
 
 // So it can be found and started from the Start menu like any app. Only made when it isn't there.
@@ -467,11 +475,20 @@ fn add_to_start_menu() {
     }) else {
         return;
     };
-    if programs.exists() {
-        return;
-    }
     unsafe {
         let Ok(link) = CoCreateInstance::<_, IShellLinkW>(&ShellLink, None, CLSCTX_INPROC_SERVER) else { return };
+        // One already there is left alone while the program it opens is still there, like the startup entry; one
+        // left pointing at a program that moved or was removed is made again for this one.
+        if programs.exists() {
+            let mut known = [0u16; 1024];
+            let opens = windows::core::Interface::cast::<IPersistFile>(&link)
+                .and_then(|file| file.Load(&HSTRING::from(programs.as_os_str()), STGM_READ))
+                .and_then(|_| link.GetPath(&mut known, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32));
+            let known = String::from_utf16_lossy(&known[..known.iter().position(|&unit| unit == 0).unwrap_or(0)]);
+            if opens.is_err() || !takes_over(&known, &target.to_string_lossy(), |path| std::path::Path::new(path).is_file()) {
+                return;
+            }
+        }
         let path = HSTRING::from(target.as_os_str());
         let _ = link.SetPath(&path);
         if let Some(folder) = target.parent() {
@@ -2470,5 +2487,21 @@ fn main() {
             let _ = DestroyWindow(app.guide);
         });
         APP.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::takes_over;
+
+    #[test]
+    fn startup_stays_with_a_program_that_is_still_there() {
+        let installed = r#""C:\Programs\DesktopWidgets\desktop-widgets.exe""#;
+        let build = r#""D:\DesktopWidgets\target\release\desktop-widgets.exe""#;
+        let there = |path: &str| path == r"C:\Programs\DesktopWidgets\desktop-widgets.exe";
+        assert!(!takes_over(installed, build, there));
+        assert!(!takes_over(installed, installed, there));
+        assert!(takes_over(installed, build, |_| false));
+        assert!(!takes_over(&installed.to_uppercase(), installed, |_| false));
     }
 }

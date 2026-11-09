@@ -48,4 +48,51 @@ if ((Get-FileHash target\release\desktop-widgets.exe).Hash -ne (Get-FileHash "$i
     "$install\desktop-widgets.exe is not the program just built"
     exit 1
 }
+# Builds before this one installed into app\ next to the source. The first install here brings that copy's settings,
+# to-dos and backups along (never over files already here), and moves the startup entry and Start menu shortcut that
+# still open the old copy, which would otherwise stay with it and stop working once this drive is unplugged.
+# A marker file stays while the move isn't finished, so a build after a failed one carries on with what's missing
+# instead of taking the files already there for a finished move; until it's finished nothing else is switched over.
+$old = Join-Path $PSScriptRoot 'app'
+$oldExe = Join-Path $old 'desktop-widgets.exe'
+$newExe = Join-Path $install 'desktop-widgets.exe'
+$moving = Join-Path $install 'moving-from-app.txt'
+$fresh = -not (Test-Path "$install\widgets.ini") -and -not (Test-Path "$install\todo.txt")
+if ((Test-Path $old) -and ($fresh -or (Test-Path $moving))) {
+    try {
+        Set-Content $moving "Settings and to-dos are being moved here from $old; build.ps1 removes this once that's done." -ErrorAction Stop
+        foreach ($file in @(Get-ChildItem $old -File -ErrorAction Stop | Where-Object { $_.Name -ne 'desktop-widgets.exe' })) {
+            $target = Join-Path $install $file.Name
+            if (-not (Test-Path $target)) {
+                # Copied under another name first, so a copy cut short is never taken for the file.
+                Copy-Item $file.FullName "$target.part" -Force -ErrorAction Stop
+                Move-Item "$target.part" $target -ErrorAction Stop
+                "moved $($file.Name) from app\"
+            }
+        }
+        Remove-Item $moving -ErrorAction Stop
+    } catch {
+        Remove-Item "$install\*.part" -ErrorAction SilentlyContinue
+        "moving settings and to-dos from app\ didn't finish: $($_.Exception.Message)"
+        "the startup entry and Start menu shortcut still open the old copy; run build.ps1 again to finish"
+        exit 1
+    }
+}
+$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$run = (Get-ItemProperty $runKey -ErrorAction SilentlyContinue).DesktopWidgets
+if ($run -and $run.Trim().Trim('"') -eq $oldExe) {
+    Set-ItemProperty $runKey DesktopWidgets "`"$newExe`""
+    "startup entry now opens $newExe"
+}
+$shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\桌面小工具.lnk'
+if (Test-Path $shortcut) {
+    $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
+    if ($link.TargetPath -eq $oldExe) {
+        $link.TargetPath = $newExe
+        $link.WorkingDirectory = $install
+        $link.Save()
+        "Start menu shortcut now opens $newExe"
+    }
+}
+
 "built $install\desktop-widgets.exe ($([math]::Round((Get-Item "$install\desktop-widgets.exe").Length / 1KB)) KB)"
